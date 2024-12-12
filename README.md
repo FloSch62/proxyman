@@ -4,7 +4,6 @@ ProxyMan is a shell script to manage system-wide proxy settings on Linux systems
 
 ## Features
 
-- Reads proxy configuration from `/etc/proxy.conf` so you don't have to edit the script.
 - Sets and unsets proxies for:
   - `/etc/environment`
   - Package managers: `/etc/apt/apt.conf` (apt), `/etc/dnf/dnf.conf` (dnf), or `/etc/yum.conf` (yum)
