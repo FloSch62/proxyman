@@ -1,22 +1,46 @@
 # ProxyMan
 
-ProxyMan is a shell script to manage system-wide proxy settings on Linux systems. It supports both Debian/Ubuntu-based (using `apt`) and RHEL/CentOS/Fedora-based systems (using `dnf` or `yum`). It can also configure proxies for `wget`, Docker (both system daemon and per-user Docker settings), and system-wide environment variables.
+ProxyMan is a shell script to manage system-wide proxy settings on Linux systems. It supports both Debian/Ubuntu-based (using `apt`) and RHEL/CentOS/Fedora-based systems (using `dnf` or `yum`). In addition, it configures proxies for `wget`, Docker (both system daemon and per-user Docker settings), and system-wide environment variables like `http_proxy`, `https_proxy`, and `no_proxy`.
+
 
 ## Features
 
-- Sets and unsets proxies for:
-  - `/etc/environment`
-  - Package managers: `/etc/apt/apt.conf` (apt), `/etc/dnf/dnf.conf` (dnf), or `/etc/yum.conf` (yum)
-  - `/etc/wgetrc`
-  - Docker system-wide: `/etc/docker/daemon.json` and `/etc/systemd/system/docker.service.d/http-proxy.conf`
-  - Per-user Docker config: `~/.docker/config.json`
-- Creates backups of these configuration files when you run `set`, and restores them when you run `unset`.
-- Provides `export` and `unexport` commands to easily apply or remove proxy settings from your current shell session without logging out.
+- **Package Manager Support:**  
+  Detects your system’s package manager (`apt`, `dnf`, or `yum`) and configures the proxy settings accordingly.
+  
+- **System-Wide Environment Variables:**  
+  Configures `/etc/environment` to set `http_proxy`, `https_proxy`, `no_proxy` and their uppercase variants globally.
 
+- **Wget Proxy Configuration:**  
+  Updates `/etc/wgetrc` so `wget` commands use the configured proxy.
+
+- **Docker Proxy Configuration:**
+  - Sets system-wide Docker proxy via `/etc/docker/daemon.json`.
+  - Creates or updates a systemd drop-in file at `/etc/systemd/system/docker.service.d/http-proxy.conf` to allow the Docker daemon to pull images via the proxy.
+  - Configures per-user Docker proxy settings in `~/.docker/config.json` for the user who ran `sudo`.
+
+- **Backup and Restore Mechanism:**
+  - When you run `set`, ProxyMan creates backups of all files it modifies, if not already existing.
+  - When you run `unset`, it restores these backups, effectively removing the proxy settings.
+  - When you run `purge`, it removes all proxy settings and all backup files permanently.
+
+- **Interactive Mode:**
+  - If `/etc/proxy.conf` does not exist, ProxyMan can prompt you for `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` interactively.
+  - Default `NO_PROXY` values cover local IP ranges and docker0 networks, so you don’t have to guess.
+
+- **Shell Integration:**
+  - The `export` command prints `export` statements so you can `eval` them to apply proxy vars to your current shell session without reopening it.
+  - The `unexport` command prints `unset` statements to remove the proxy vars from your current shell.
+
+- **Safe and User-Friendly:**
+  - Color-coded output helps distinguish success messages (green), prompts/warnings (yellow), and errors (red).
+  - Before destructive operations like `purge`, it asks for confirmation.
+  - Clear instructions are printed after `set` and `unset` so you know the next steps.
+    
 ## Requirements
 
-- Run as root (via `sudo`), because it modifies system files.
-- `/etc/proxy.conf` must exist with these variables set:
+- Run as root (via `sudo`), since system-wide configuration files are modified.
+- If you prefer a non-interactive setup, ensure `/etc/proxy.conf` exists with:
   
   ```bash
   HTTP_PROXY=http://proxy.example.com:8080
@@ -25,6 +49,7 @@ ProxyMan is a shell script to manage system-wide proxy settings on Linux systems
   ```
   
 Adjust these values to match your actual proxy setup.
+If `/etc/proxy.conf` is missing, ProxyMan will prompt you interactively to enter these values when you run `set`.
 
 ## Installation
 1. Copy the proxyman.sh script to a location in your $PATH, for example:
@@ -38,22 +63,22 @@ sudo chmod +x /usr/local/bin/proxyman
 
 ## Usage
 
-Run all commands as root (via sudo):
+Run all commands with `sudo`:
 - **Set proxy:**
   
 ```bash
 sudo proxyman set
 ```
 
-This will configure all system-wide files, Docker, and the per-user Docker config. It will print instructions on how to apply the settings to your current shell.
+This configures all system-wide files, Docker, and per-user Docker config. If `/etc/proxy.conf` is missing, it will prompt you interactively. After setting, ProxyMan will print instructions on how to apply these settings to your current shell (using `eval "$(sudo proxyman export)"`).
 
-- **UNset proxy:**
+- **Unset proxy:**
   
 ```bash
 sudo proxyman unset
 ```
 
-This restores the original configurations from backups and removes the proxy settings. It will print instructions on how to remove the settings from your current shell.
+Restores original configurations from backups and removes proxy settings. After unsetting, it will print instructions on how to remove the settings from your current shell (using `eval "$(sudo proxyman unexport)"`).
 
 - **List current settings:**
   
