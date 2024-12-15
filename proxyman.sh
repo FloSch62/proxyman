@@ -13,14 +13,14 @@
 # Features:
 # - Reads from /etc/proxy.conf or prompts interactively if missing.
 # - Configures proxies for:
-#   * /etc/environment (system-wide env vars)
+#   * /etc/profile.d/custom_export.sh (to set env vars)
 #   * Package manager (apt/dnf/yum)
 #   * /etc/wgetrc
 #   * Docker daemon (daemon.json + systemd drop-in)
 #   * Per-user Docker config (~/.docker/config.json)
 #
-# On 'set', creates backups if not existing.
-# On 'unset', restores from backups.
+# On 'set', creates backups of configs (except custom_export.sh).
+# On 'unset', restores from backups and removes custom_export.sh.
 # On 'purge', removes all settings and backups.
 #
 # After setting proxy:
@@ -44,16 +44,17 @@ RESET="\e[0m"
 # Configuration file paths
 ##########################
 CONFIG_FILE="/etc/proxy.conf"
-ENV_FILE="/etc/environment"
 WGET_CONF="/etc/wgetrc"
 DOCKER_CONF="/etc/docker/daemon.json"
 DOCKER_SYSTEMD_DIR="/etc/systemd/system/docker.service.d"
 DOCKER_SYSTEMD_PROXY_CONF="${DOCKER_SYSTEMD_DIR}/http-proxy.conf"
 
+# This is the new file for environment variables:
+CUSTOM_EXPORT_FILE="/etc/profile.d/custom_export.sh"
+
 ##########################
 # Backup file paths
 ##########################
-ENV_BAK="${ENV_FILE}.bak"
 WGET_BAK="${WGET_CONF}.bak"
 DOCKER_BAK="${DOCKER_CONF}.bak"
 DOCKER_SYSTEMD_BAK="${DOCKER_SYSTEMD_PROXY_CONF}.bak"
@@ -71,7 +72,6 @@ USER_DOCKER_BAK="${USER_DOCKER_CONF}.bak"
 
 ##########################
 # Detect package manager
-# We handle apt/dnf/yum depending on the system.
 ##########################
 APT_EXISTS=$(command -v apt)
 DNF_EXISTS=$(command -v dnf)
@@ -99,7 +99,7 @@ print_help() {
     echo
     echo -e "${BOLD}Commands:${RESET}"
     echo "  set       - Set the proxy (from /etc/proxy.conf or interactively)"
-    echo "  unset     - Unset the proxy and restore original configurations"
+    echo "  unset     - Unset the proxy and restore original configurations, removing $CUSTOM_EXPORT_FILE"
     echo "  purge     - Completely remove all proxy settings and backups"
     echo "  list      - List current proxy settings"
     echo "  export    - Print export commands for current shell"
@@ -123,7 +123,7 @@ print_help() {
 
 ##########################
 # read_config:
-# Load proxy vars from /etc/proxy.conf or prompt user interactively if missing.
+# Load proxy vars from /etc/proxy.conf or prompt user if missing.
 ##########################
 read_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -136,7 +136,6 @@ read_config() {
             echo "Enter HTTPS proxy (e.g. http://proxy.example.com:8080):"
             read -r HTTPS_PROXY
 
-            # Provide a sensible default for NO_PROXY
             DEFAULT_NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,172.17.0.0/16"
             echo "Enter NO_PROXY [default: ${DEFAULT_NO_PROXY}]:"
             read -r NO_PROXY
@@ -144,7 +143,6 @@ read_config() {
                 NO_PROXY="$DEFAULT_NO_PROXY"
             fi
 
-            # Ensure all values are provided
             if [ -z "$HTTP_PROXY" ] || [ -z "$HTTPS_PROXY" ] || [ -z "$NO_PROXY" ]; then
                 echo -e "${RED}All required values (HTTP_PROXY, HTTPS_PROXY, NO_PROXY) must be provided.${RESET}"
                 exit 1
@@ -165,22 +163,16 @@ EOF
             exit 1
         fi
     else
-        # If config file exists, source it
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
     fi
 
-    # Validate that HTTP_PROXY, HTTPS_PROXY, NO_PROXY are set
     if [ -z "$HTTP_PROXY" ] || [ -z "$HTTPS_PROXY" ] || [ -z "$NO_PROXY" ]; then
         echo -e "${RED}HTTP_PROXY, HTTPS_PROXY, NO_PROXY must be set.${RESET}"
         exit 1
     fi
 }
 
-##########################
-# backup_file_if_needed:
-# Creates a backup of a file if it doesn't already exist.
-##########################
 backup_file_if_needed() {
     local file="$1"
     local backup="$2"
@@ -195,10 +187,6 @@ backup_file_if_needed() {
     fi
 }
 
-##########################
-# restore_file_if_exists:
-# Restore a file from its backup if the backup exists, otherwise remove the file.
-##########################
 restore_file_if_exists() {
     local file="$1"
     local backup="$2"
@@ -211,10 +199,6 @@ restore_file_if_exists() {
     fi
 }
 
-##########################
-# set_user_docker_proxy:
-# Sets the per-user Docker proxies in ~/.docker/config.json
-##########################
 set_user_docker_proxy() {
     mkdir -p "$USER_DOCKER_DIR"
     if [ -f "$USER_DOCKER_CONF" ] && [ ! -f "$USER_DOCKER_BAK" ]; then
@@ -239,21 +223,12 @@ EOF
     chown "$USERNAME":"$USERNAME" "$USER_DOCKER_CONF"
 }
 
-##########################
-# unset_user_docker_proxy:
-# Restore original user Docker proxy config
-##########################
 unset_user_docker_proxy() {
     restore_file_if_exists "$USER_DOCKER_CONF" "$USER_DOCKER_BAK"
 }
 
-##########################
-# set_systemd_docker_proxy:
-# Creates or updates the systemd drop-in for Docker with the current proxy settings.
-##########################
 set_systemd_docker_proxy() {
     backup_file_if_needed "$DOCKER_SYSTEMD_PROXY_CONF" "$DOCKER_SYSTEMD_BAK"
-
     mkdir -p "$DOCKER_SYSTEMD_DIR"
     cat > "$DOCKER_SYSTEMD_PROXY_CONF" <<EOF
 [Service]
@@ -263,24 +238,41 @@ Environment="NO_PROXY=$NO_PROXY"
 EOF
 }
 
-##########################
-# unset_systemd_docker_proxy:
-# Restore or remove the systemd drop-in for Docker proxy.
-##########################
 unset_systemd_docker_proxy() {
     restore_file_if_exists "$DOCKER_SYSTEMD_PROXY_CONF" "$DOCKER_SYSTEMD_BAK"
 }
 
 ##########################
+# maybe_reload_docker:
+# Checks if docker is available and if containers are running.
+# If containers are running, prompt user before restarting docker.
+##########################
+maybe_reload_docker() {
+    if command -v docker &>/dev/null; then
+        CONTAINERS=$(docker ps -q)
+        if [ -n "$CONTAINERS" ]; then
+            echo -e "${YELLOW}Docker service is running with active containers.${RESET}"
+            echo "Restarting Docker will interrupt these containers."
+            echo "Do you want to restart Docker now so changes take effect? [y/N]"
+            read -r docker_ans
+            if [[ ! "$docker_ans" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}Skipping Docker restart. Changes won't take effect until Docker is restarted manually.${RESET}"
+                return
+            fi
+        fi
+        systemctl daemon-reload
+        systemctl restart docker
+    fi
+}
+
+##########################
 # set_proxy:
-# Main function to set the proxy. Reads config, creates backups, modifies files,
-# updates Docker, prints instructions.
+# Now stores env vars in CUSTOM_EXPORT_FILE instead of /etc/environment
 ##########################
 set_proxy() {
     read_config
 
-    # Backup current files if needed
-    backup_file_if_needed "$ENV_FILE" "${ENV_BAK}"
+    # Backup other files if needed (no backup for CUSTOM_EXPORT_FILE)
     backup_file_if_needed "$WGET_CONF" "${WGET_BAK}"
     backup_file_if_needed "$DOCKER_CONF" "${DOCKER_BAK}"
     backup_file_if_needed "$DOCKER_SYSTEMD_PROXY_CONF" "${DOCKER_SYSTEMD_BAK}"
@@ -288,33 +280,29 @@ set_proxy() {
         backup_file_if_needed "$PM_CONF" "$PM_BAK"
     fi
 
-    # Update /etc/environment
-    cp "$ENV_BAK" "$ENV_FILE"
-    sed -i '/http_proxy\|https_proxy\|no_proxy\|HTTP_PROXY\|HTTPS_PROXY\|NO_PROXY/d' "$ENV_FILE"
-    {
-      echo "http_proxy=\"$HTTP_PROXY\""
-      echo "https_proxy=\"$HTTPS_PROXY\""
-      echo "no_proxy=\"$NO_PROXY\""
-      echo "HTTP_PROXY=\"$HTTP_PROXY\""
-      echo "HTTPS_PROXY=\"$HTTPS_PROXY\""
-      echo "NO_PROXY=\"$NO_PROXY\""
-    } >> "$ENV_FILE"
+    # Create/update /etc/profile.d/custom_export.sh
+    mkdir -p /etc/profile.d
+    cat > "$CUSTOM_EXPORT_FILE" <<EOF
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export no_proxy="$NO_PROXY"
+export HTTP_PROXY="$HTTP_PROXY"
+export HTTPS_PROXY="$HTTPS_PROXY"
+export NO_PROXY="$NO_PROXY"
+EOF
 
-    # Update package manager configuration
+    # Update package manager configs
     if [ -n "$PM_CONF" ] && [ -f "$PM_CONF" ]; then
         if [ -n "$APT_EXISTS" ]; then
-            # APT
             cp "$PM_BAK" "$PM_CONF"
             sed -i '/Acquire::.*Proxy/d' "$PM_CONF"
             echo "Acquire::HTTP::Proxy \"$HTTP_PROXY\";" >> "$PM_CONF"
             echo "Acquire::HTTPS::Proxy \"$HTTPS_PROXY\";" >> "$PM_CONF"
         elif [ -n "$DNF_EXISTS" ]; then
-            # DNF
             cp "$PM_BAK" "$PM_CONF"
             sed -i '/proxy=/d' "$PM_CONF"
             echo "proxy=$HTTP_PROXY" >> "$PM_CONF"
         elif [ -n "$YUM_EXISTS" ]; then
-            # YUM
             cp "$PM_BAK" "$PM_CONF"
             sed -i '/proxy=/d' "$PM_CONF"
             echo "proxy=$HTTP_PROXY" >> "$PM_CONF"
@@ -331,7 +319,7 @@ set_proxy() {
       echo "no_proxy = $NO_PROXY"
     } >> "$WGET_CONF"
 
-    # Update Docker daemon.json
+    # Update Docker configs
     cp "$DOCKER_BAK" "$DOCKER_CONF"
     cat > "$DOCKER_CONF" <<EOF
 {
@@ -341,33 +329,31 @@ set_proxy() {
 }
 EOF
 
-    # Update systemd Docker proxy & user Docker config
     set_systemd_docker_proxy
     set_user_docker_proxy
 
-    # Reload Docker if present
-    if command -v docker &>/dev/null; then
-        systemctl daemon-reload
-        systemctl restart docker
-    fi
+    # Maybe reload docker
+    maybe_reload_docker
 
     echo -e "${GREEN}Proxy set successfully.${RESET}"
-    echo -e "System-wide files updated, Docker reloaded."
+    echo -e "System-wide files updated."
     echo
     echo -e "${YELLOW}To apply these vars to your current shell, run:${RESET}"
     echo "  eval \"\$(sudo $0 export)\""
     echo "or reopen your shell."
     echo
     echo "Or copy and paste these commands to export them now:"
-    grep -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' "$ENV_FILE" | sed 's/^/export /'
+    grep -E '^(export http_proxy|export https_proxy|export no_proxy|export HTTP_PROXY|export HTTPS_PROXY|export NO_PROXY)=' "$CUSTOM_EXPORT_FILE"
 }
 
 ##########################
 # unset_proxy:
-# Restore from backups, remove proxy settings, reload docker.
+# Removes proxy config and restores backups. Also removes $CUSTOM_EXPORT_FILE.
 ##########################
 unset_proxy() {
-    restore_file_if_exists "$ENV_FILE" "${ENV_BAK}"
+    # Remove the custom export file
+    rm -f "$CUSTOM_EXPORT_FILE"
+
     restore_file_if_exists "$WGET_CONF" "${WGET_BAK}"
     restore_file_if_exists "$DOCKER_CONF" "${DOCKER_BAK}"
     restore_file_if_exists "$DOCKER_SYSTEMD_PROXY_CONF" "${DOCKER_SYSTEMD_BAK}"
@@ -377,13 +363,11 @@ unset_proxy() {
     unset_user_docker_proxy
     unset_systemd_docker_proxy
 
-    if command -v docker &>/dev/null; then
-        systemctl daemon-reload
-        systemctl restart docker
-    fi
+    # Maybe reload docker
+    maybe_reload_docker
 
     echo -e "${GREEN}Proxy unset successfully.${RESET}"
-    echo "Original configurations restored from backups. Docker reloaded."
+    echo "Original configurations restored."
     echo
     echo -e "${YELLOW}To remove these vars from your current shell, run:${RESET}"
     echo "  eval \"\$(sudo $0 unexport)\""
@@ -398,15 +382,15 @@ unset_proxy() {
     echo "unset NO_PROXY"
 }
 
-##########################
-# list_proxy:
-# Display current settings for environment, package manager, wget, docker.
-##########################
 list_proxy() {
     echo "Current proxy settings:"
 
-    echo "Environment ($ENV_FILE):"
-    grep -E 'http_proxy=|https_proxy=|no_proxy=' "$ENV_FILE" || echo "No environment proxy set."
+    echo "From $CUSTOM_EXPORT_FILE:"
+    if [ -f "$CUSTOM_EXPORT_FILE" ]; then
+        grep -E 'export (http_proxy|https_proxy|no_proxy)' "$CUSTOM_EXPORT_FILE" || echo "No environment proxy set."
+    else
+        echo "No environment proxy set."
+    fi
 
     echo
     if [ -n "$PM_CONF" ] && [ -f "$PM_CONF" ]; then
@@ -460,19 +444,13 @@ list_proxy() {
     fi
 }
 
-##########################
-# export_vars:
-# Print export commands for current shell.
-##########################
 export_vars() {
-    grep -E '^(http_proxy|https_proxy|no_proxy|HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' "$ENV_FILE" \
-        | sed 's/^/export /'
+    # Print export commands from CUSTOM_EXPORT_FILE instead of ENV_FILE
+    if [ -f "$CUSTOM_EXPORT_FILE" ]; then
+        grep -E '^(export http_proxy|export https_proxy|export no_proxy|export HTTP_PROXY|export HTTPS_PROXY|export NO_PROXY)=' "$CUSTOM_EXPORT_FILE"
+    fi
 }
 
-##########################
-# unexport_vars:
-# Print unset commands to remove proxy vars from current shell.
-##########################
 unexport_vars() {
     echo "unset http_proxy"
     echo "unset https_proxy"
@@ -482,12 +460,8 @@ unexport_vars() {
     echo "unset NO_PROXY"
 }
 
-##########################
-# purge_backups:
-# Remove all backup files.
-##########################
 purge_backups() {
-    rm -f "${ENV_BAK}" "${WGET_BAK}" "${DOCKER_BAK}" "${DOCKER_SYSTEMD_BAK}"
+    rm -f "${WGET_BAK}" "${DOCKER_BAK}" "${DOCKER_SYSTEMD_BAK}"
     rm -f "${USER_DOCKER_BAK}"
     if [ -n "$PM_BAK" ]; then
         rm -f "$PM_BAK"
@@ -495,10 +469,6 @@ purge_backups() {
     echo -e "${GREEN}All backups removed.${RESET}"
 }
 
-##########################
-# purge_all:
-# Confirm and then unset proxy, remove all backups.
-##########################
 purge_all() {
     echo -e "${RED}WARNING: This will remove all proxy settings and all backups permanently.${RESET}"
     echo "Are you sure? [y/N]"
@@ -513,17 +483,11 @@ purge_all() {
     echo -e "${GREEN}Purge completed.${RESET} All proxy settings and backups removed."
 }
 
-##########################
-# Must run as root to proceed
-##########################
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Please run as root (sudo).${RESET}"
     exit 1
 fi
 
-##########################
-# Main command dispatch
-##########################
 case "$1" in
   set)
     set_proxy
